@@ -1,0 +1,25 @@
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: auto-instrumentation
+spec:
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:2.7.0
+    env:
+    - name: OTEL_EXPORTER_OTLP_PROTOCOL
+      value: http/protobuf
+    - name: OTEL_LOGS_EXPORTER
+      value: otlp
+
+    # - name: OTEL_EXPORTER_OTLP_METRICS_PROTOCOL
+    #   value: http/json
+    # - name: OTEL_EXPORTER_OTLP_LOGS_PROTOCOL
+    #   value: http/json
+  exporter:
+    endpoint: http://alloy.nightswatch.svc.cluster.local:4318
+  propagators:
+    - tracecontext
+    - baggage
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1"
