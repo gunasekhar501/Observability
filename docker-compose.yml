@@ -1,0 +1,434 @@
+version: '3.9'
+
+# ══════════════════════════════════════════════════════════════
+#  SecureOps — Full Self-Hosted Stack (No Cloud Required)
+#  Services: GitLab CE · SonarQube · PostgreSQL · MinIO ·
+#            Wiki.js · Plane · Mattermost · SecureOps API/UI
+# ══════════════════════════════════════════════════════════════
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  secureops-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  postgres-data:
+  minio-data:
+  gitlab-data:
+  gitlab-config:
+  gitlab-logs:
+  gitlab-runner-config:
+  sonarqube-data:
+  sonarqube-extensions:
+  sonarqube-logs:
+  sonarqube-temp:
+  wikijs-data:
+  plane-redis-data:
+  plane-db-data:
+  plane-media:
+  mattermost-data:
+  mattermost-logs:
+  mattermost-config:
+  mattermost-plugins:
+
+services:
+
+  # ────────────────────────────────────────────────────────────
+  # POSTGRES — shared instance, separate databases per service
+  # ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    <<: [*restart, *logging]
+    container_name: secureops-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-secureops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secureops_secret}
+      POSTGRES_MULTIPLE_DATABASES: secureops,sonarqube,wikijs,plane,mattermost
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-secureops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────────────────────────────────────
+  # MINIO — S3-compatible store for Terraform state + artefacts
+  # ────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    <<: [*restart, *logging]
+    container_name: secureops-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin_secret}
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console  →  http://localhost:9001
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # MinIO bucket initialisation (runs once then exits)
+  minio-init:
+    image: minio/mc:latest
+    container_name: secureops-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - secureops-net
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin_secret};
+        mc mb --ignore-existing local/terraform-state;
+        mc mb --ignore-existing local/pipeline-reports;
+        mc mb --ignore-existing local/plane-uploads;
+        echo 'MinIO buckets ready';
+      "
+
+  # ────────────────────────────────────────────────────────────
+  # GITLAB CE — Git hosting + CI/CD + built-in container registry
+  #             http://localhost:8929   registry: localhost:5050
+  # ────────────────────────────────────────────────────────────
+  gitlab:
+    image: gitlab/gitlab-ce:16.10.0-ce.0
+    <<: [*restart, *logging]
+    container_name: secureops-gitlab
+    hostname: gitlab.local
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8929'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD:-SecureOps2026!}'
+        gitlab_rails['smtp_enable'] = false
+        registry_external_url 'http://localhost:5050'
+        gitlab_rails['registry_enabled'] = true
+        registry_nginx['listen_port'] = 5050
+        registry_nginx['listen_https'] = false
+        nginx['listen_port'] = 8929
+        nginx['listen_https'] = false
+        prometheus_monitoring['enable'] = false
+        grafana['enable'] = false
+        gitlab_rails['usage_ping_enabled'] = false
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    ports:
+      - "8929:8929"   # Web UI   →  http://localhost:8929
+      - "5050:5050"   # Registry →  http://localhost:5050
+      - "2222:22"     # SSH
+    networks:
+      - secureops-net
+    shm_size: '256m'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8929/-/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+
+  # ────────────────────────────────────────────────────────────
+  # GITLAB RUNNER — executes CI pipeline jobs
+  # ────────────────────────────────────────────────────────────
+  gitlab-runner:
+    image: gitlab/gitlab-runner:alpine3.18
+    <<: [*restart, *logging]
+    container_name: secureops-gitlab-runner
+    depends_on:
+      - gitlab
+    volumes:
+      - gitlab-runner-config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - secureops-net
+    environment:
+      - CI_SERVER_URL=http://gitlab:8929
+      - REGISTRATION_TOKEN=${GITLAB_RUNNER_TOKEN:-}
+
+  # ────────────────────────────────────────────────────────────
+  # SONARQUBE CE — static analysis + quality gate
+  #                http://localhost:9200   admin / admin
+  # ────────────────────────────────────────────────────────────
+  sonarqube:
+    image: sonarqube:10.4-community
+    <<: [*restart, *logging]
+    container_name: secureops-sonarqube
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonarqube
+      SONAR_JDBC_USERNAME: ${POSTGRES_USER:-secureops}
+      SONAR_JDBC_PASSWORD: ${POSTGRES_PASSWORD:-secureops_secret}
+      SONAR_WEB_PORT: 9200
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-extensions:/opt/sonarqube/extensions
+      - sonarqube-logs:/opt/sonarqube/logs
+      - sonarqube-temp:/opt/sonarqube/temp
+    ports:
+      - "9200:9200"   # Web UI  →  http://localhost:9200
+    networks:
+      - secureops-net
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/api/system/status | grep -q UP"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ────────────────────────────────────────────────────────────
+  # WIKI.JS — Confluence replacement for RCA pages
+  #           http://localhost:3000
+  # ────────────────────────────────────────────────────────────
+  wikijs:
+    image: requarks/wiki:2
+    <<: [*restart, *logging]
+    container_name: secureops-wikijs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-secureops}
+      DB_PASS: ${POSTGRES_PASSWORD:-secureops_secret}
+      DB_NAME: wikijs
+    volumes:
+      - wikijs-data:/wiki/data/content
+    ports:
+      - "3000:3000"   # Web UI  →  http://localhost:3000
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ────────────────────────────────────────────────────────────
+  # PLANE — Jira replacement for issue / incident tracking
+  #         http://localhost:3001
+  # ────────────────────────────────────────────────────────────
+  plane-redis:
+    image: redis:7-alpine
+    <<: [*restart, *logging]
+    container_name: secureops-plane-redis
+    command: redis-server --requirepass ${PLANE_REDIS_PASSWORD:-plane_redis_secret}
+    volumes:
+      - plane-redis-data:/data
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${PLANE_REDIS_PASSWORD:-plane_redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  plane-api:
+    image: makeplane/plane-backend:stable
+    <<: [*restart, *logging]
+    container_name: secureops-plane-api
+    command: ./bin/takeoff
+    depends_on:
+      postgres:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY:-plane_super_secret_key_change_me}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-secureops}:${POSTGRES_PASSWORD:-secureops_secret}@postgres:5432/plane
+      REDIS_URL: redis://:${PLANE_REDIS_PASSWORD:-plane_redis_secret}@plane-redis:6379/
+      WEB_URL: http://localhost:3001
+      CORS_ALLOWED_ORIGINS: http://localhost:3001,http://localhost:8081
+      DEFAULT_EMAIL: ${PLANE_ADMIN_EMAIL:-admin@secureops.local}
+      DEFAULT_PASSWORD: ${PLANE_ADMIN_PASSWORD:-SecureOps2026!}
+      ENABLE_SIGNUP: "1"
+      ENABLE_EMAIL_PASSWORD: "1"
+      GUNICORN_WORKERS: 2
+    volumes:
+      - plane-media:/code/plane/media
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  plane-worker:
+    image: makeplane/plane-backend:stable
+    <<: [*restart, *logging]
+    container_name: secureops-plane-worker
+    command: ./bin/worker
+    depends_on:
+      plane-api:
+        condition: service_healthy
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY:-plane_super_secret_key_change_me}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-secureops}:${POSTGRES_PASSWORD:-secureops_secret}@postgres:5432/plane
+      REDIS_URL: redis://:${PLANE_REDIS_PASSWORD:-plane_redis_secret}@plane-redis:6379/
+    volumes:
+      - plane-media:/code/plane/media
+    networks:
+      - secureops-net
+
+  plane-beat:
+    image: makeplane/plane-backend:stable
+    <<: [*restart, *logging]
+    container_name: secureops-plane-beat
+    command: ./bin/beat
+    depends_on:
+      plane-api:
+        condition: service_healthy
+    environment:
+      SECRET_KEY: ${PLANE_SECRET_KEY:-plane_super_secret_key_change_me}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-secureops}:${POSTGRES_PASSWORD:-secureops_secret}@postgres:5432/plane
+      REDIS_URL: redis://:${PLANE_REDIS_PASSWORD:-plane_redis_secret}@plane-redis:6379/
+    networks:
+      - secureops-net
+
+  plane-web:
+    image: makeplane/plane-frontend:stable
+    <<: [*restart, *logging]
+    container_name: secureops-plane-web
+    depends_on:
+      plane-api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://plane-api:8000
+      NEXT_PUBLIC_DEPLOY_WITH_NGINX: "1"
+    ports:
+      - "3001:3000"   # Web UI  →  http://localhost:3001
+    networks:
+      - secureops-net
+
+  # ────────────────────────────────────────────────────────────
+  # MATTERMOST — Slack replacement for alerts
+  #              http://localhost:8065
+  # ────────────────────────────────────────────────────────────
+  mattermost:
+    image: mattermost/mattermost-team-edition:9.5
+    <<: [*restart, *logging]
+    container_name: secureops-mattermost
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://${POSTGRES_USER:-secureops}:${POSTGRES_PASSWORD:-secureops_secret}@postgres:5432/mattermost?sslmode=disable
+      MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+      MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
+      MM_TEAMSETTINGS_SITENAME: SecureOps Alerts
+      MM_EMAILSETTINGS_ENABLESMTPAUTH: "false"
+      MM_EMAILSETTINGS_SMTPSERVER: ""
+      MM_PLUGINSETTINGS_ENABLEUPLOADS: "true"
+    volumes:
+      - mattermost-data:/mattermost/data
+      - mattermost-logs:/mattermost/logs
+      - mattermost-config:/mattermost/config
+      - mattermost-plugins:/mattermost/plugins
+    ports:
+      - "8065:8065"   # Web UI  →  http://localhost:8065
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8065/api/v4/system/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ────────────────────────────────────────────────────────────
+  # SECUREOPS API — FastAPI backend: webhooks, findings, incidents
+  #                 http://localhost:8080
+  # ────────────────────────────────────────────────────────────
+  secureops-api:
+    build:
+      context: ./secureops-api
+      dockerfile: Dockerfile
+    <<: [*restart, *logging]
+    container_name: secureops-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-secureops}:${POSTGRES_PASSWORD:-secureops_secret}@postgres:5432/secureops
+      GITLAB_URL: http://gitlab:8929
+      GITLAB_TOKEN: ${GITLAB_API_TOKEN:-}
+      SONAR_URL: http://sonarqube:9200
+      SONAR_TOKEN: ${SONAR_TOKEN:-}
+      PLANE_URL: http://plane-api:8000
+      PLANE_TOKEN: ${PLANE_API_TOKEN:-}
+      PLANE_WORKSPACE: ${PLANE_WORKSPACE:-secureops}
+      PLANE_PROJECT: ${PLANE_PROJECT_ID:-}
+      WIKIJS_URL: http://wikijs:3000
+      WIKIJS_TOKEN: ${WIKIJS_API_TOKEN:-}
+      MATTERMOST_URL: http://mattermost:8065
+      MATTERMOST_WEBHOOK: ${MATTERMOST_WEBHOOK_URL:-}
+      SECRET_KEY: ${API_SECRET_KEY:-change_me_in_production}
+    ports:
+      - "8080:8080"   # REST API  →  http://localhost:8080
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────────────────────────────────────
+  # SECUREOPS DASHBOARD — nginx serving the HTML dashboard
+  #                       http://localhost:8081
+  # ────────────────────────────────────────────────────────────
+  secureops-dashboard:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    <<: [*restart, *logging]
+    container_name: secureops-dashboard
+    depends_on:
+      - secureops-api
+    ports:
+      - "8081:80"     # Dashboard  →  http://localhost:8081
+    networks:
+      - secureops-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
